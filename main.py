@@ -1,243 +1,228 @@
-"""Forecast GTA VI's launch-day Twitch viewers hour by hour.
+"""Forecast GTA VI launch-day Twitch viewers, hour by hour (make.fun bounty
+gta6-twitch-ccu-forecast-01).
 
-Reads one case file /input/<id>.in (history + hour-1 print) and writes
-/output/<id>.out: for hours 2..24, five quantiles (5/25/50/75/95%) of that
-hour's concurrent-viewer count. Python 3.13, standard library only, no
-network, deterministic.
+For each case the program reads hour 1's print p1 and the past launches in
+`comparables`, then forecasts hours 2..24 as five log-normal quantiles.
 
-Method (fitted at run time from the case's own comparables, never from
-hard-coded launch data):
+Model (fit fresh at runtime from the case's own comparables, nothing tuned
+to any practice answer):
 
-1. Shape set. From the case's comparables, keep past big launches whose
-   release-day hourly curve is usable (24 hours from day_start, hour 1
-   positive) and whose unlock matches GTA VI's rolling midnight-local
-   unlock: the unlock text mentions "midnight local" or "rolling" and
-   does not describe a single simultaneous global unlock (those games
-   have a near-empty hour 1 and a meaningless ratio curve). Drop
-   early-access-contaminated launches (their release day is flattened by
-   the early-access days) and weak analogues. If fewer than 4 such
-   launches remain, fall back to all tier-comparable launches, then to
-   every usable comparable.
+  For each hour h, fit a locally weighted regression of log viewers on
+  log hour-1 viewers across the comparables:
 
-2. Median ratio curve. For each hour h, take the median over the shape
-   set of log(viewers_h / viewers_1), lightly smoothed across neighbouring
-   hours. Rolling-midnight launches share GTA VI's shape: hour 1 holds
-   only the regions already unlocked (New Zealand, Europe, the UK), the
-   US east coast joins at hour 6 (05:00 UTC) and the west coast at hour 9
-   (08:00 UTC), and the evening peak lands in hours 19-24.
+      log v_h = a_h + b_h * log p1 + eps,   eps ~ N(0, sigma_h^2)
 
-3. Level regression. A plain ratio curve is fooled by hour-1 size: across
-   all comparables, log(hour-1 viewers) correlates about -0.93 with the
-   log ratio at hour 19, because absolute peaks saturate while hour 1
-   varies with unlock timing. So per hour also fit log(viewers_h) on
-   log(viewers_1) by OLS over all usable comparables, and average the two
-   log predictions 50/50. Leave-one-out over the comparables, this blend
-   scores about 0.26 mean pinball on rolling-midnight launches, against
-   about 0.39 for the house persistence baseline.
+  with Gaussian kernel weights centred on the target's log p1 (bandwidth
+  1.5 log units, widened until the effective sample is at least 6).  The
+  local fit matters because hour 1 means different things for different
+  launches: a game with a simultaneous global unlock already peaks in
+  hour 1 (ratio ~1), while a rolling-midnight console launch is barely
+  awake in hour 1 and grows several-fold by the evening peak.  The slope
+  b_h captures that: near 1 for hour 2, decaying toward ~0 by the peak
+  hours, where the level is almost independent of hour 1.  The median is
+  exp(a_h + b_h * log p1); the spread sigma_h is the weighted residual
+  standard deviation (floored at 0.30, capped at 2.0), and the five
+  quantiles are the median times exp(z_tau * sigma_h).
 
-4. Spread. The log spread for hour h is the shape set's standard
-   deviation of the log ratio at that hour (floored at 0.18, capped at
-   0.90), applied with the standard normal quantiles. An honest spread
-   matters: pinball loss charges for every hour outside the band and for
-   width at every hour.
+  If an hour has too few comparable points, or there are no usable
+  comparables at all, it falls back to persistence (median = p1) with a
+  wide spread, so the output is always a valid forecast.
 
-Fallback: with no usable comparable at all, persistence (the house
-baseline) is used, so the entry always produces a valid forecast.
+Only the standard library is used.  No network, no randomness, no state:
+two runs on the same input write byte-identical output.
 """
 
 import json
 import math
 import os
-import re
-import statistics
 import sys
+from datetime import datetime
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so a module
-# shipped beside this file would import. (This entry is one file.)
+# The grader's -P leaves this file's directory OFF sys.path; put it back
+# first, as the starter does.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
+# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+# The standard normal's quantile at each level.
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817,
+     1.6448536269514722]
+# Normal quantiles for other levels, used only if a case ever asks for them.
+Z_TABLE = {0.05: -1.6448536269514722, 0.10: -1.2815515655446004,
+           0.25: -0.6744897501960817, 0.50: 0.0,
+           0.75: 0.6744897501960817, 0.90: 1.2815515655446004,
+           0.95: 1.6448536269514722}
 
-# Blend weight on the level regression (1 - BLEND stays on the median
-# ratio curve). 0.5 was the best compromise in leave-one-out testing:
-# best on rolling-midnight launches, close to best on all launches.
-BLEND = 0.5
-SD_FLOOR = 0.18
-SD_CAP = 0.90
-# House baseline spread, used only when no comparable is usable.
-BASELINE_SIGMA = 0.15
-
-_SIMULTANEOUS = re.compile(
-    r"single global|single simultaneous|simultaneous across"
-    r"|simultaneous global|single time|simultaneous midnight gmt",
-    re.IGNORECASE,
-)
-_TIER = re.compile(r"Tier:\s*([a-z][a-z-]*)")
-_SKIP_TIERS = {"weak", "early-access-contaminated", "target-history"}
+# Gaussian kernel bandwidth in log-viewer units for the local fit.
+BANDWIDTH = 1.5
+# Widen the bandwidth until the weighted fit rests on this many points.
+MIN_EFFECTIVE_N = 6.0
+# A fit needs at least this many comparables with the hour present.
+MIN_POINTS = 6
+# Spread floor / cap for the log-normal quantiles.
+SIGMA_FLOOR = 0.30
+SIGMA_CAP = 2.0
+# Spread used when an hour cannot be fit from comparables.
+FALLBACK_SIGMA = 0.80
 
 
-def round2(x: float):
-    """Round to 2 decimals, half up; whole numbers come back as ints."""
-    scaled = x * 100.0
+def parse_ts(text):
+    """Parse an ISO 8601 UTC timestamp into an aware datetime."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def day_viewers(comp):
+    """Map release-day UTC hour (1..24) to viewers for one comparable.
+
+    A point counts only when it lies inside the comparable's release day
+    and its viewer count is a positive number.  Hours SullyGnome did not
+    sample simply stay absent.
+    """
+    try:
+        day_start = parse_ts(comp["day_start"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    out = {}
+    for point in comp.get("hourly") or []:
+        viewers = point.get("viewers")
+        if not viewers or viewers <= 0:
+            continue
+        try:
+            when = parse_ts(point["from"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        offset = (when - day_start).total_seconds() / 3600.0
+        if 0 <= offset < 24:
+            out[int(offset) + 1] = float(viewers)
+    return out
+
+
+def weighted_ols(xs, ys, ws):
+    """Weighted least squares of ys on xs; returns (intercept, slope, sd).
+
+    sd is the weighted residual standard deviation, the spread the
+    quantiles are built from.
+    """
+    total_w = sum(ws)
+    if total_w <= 0:
+        return 0.0, 0.0, FALLBACK_SIGMA
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+    sxx = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+    sxy = sum(w * (x - mean_x) * (y - mean_y)
+              for w, x, y in zip(ws, xs, ys))
+    slope = sxy / sxx if sxx > 1e-9 else 0.0
+    intercept = mean_y - slope * mean_x
+    resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    var = sum(w * r * r for w, r in zip(ws, resid)) / max(total_w - 2.0, 1.0)
+    return intercept, slope, math.sqrt(var) if var > 0 else 0.0
+
+
+def round2(x):
+    """x rounded to 2 decimals, half up, as the starter rounds it."""
+    scaled = x * 100
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 100.0
+    value = whole / 100
     return int(value) if value == int(value) else value
 
 
-def release_day_viewers(comp: dict):
-    """The 24 hourly viewer counts of a comparable's release day, or None."""
-    day_start = comp.get("day_start")
-    hourly = comp.get("hourly") or []
-    start = None
-    for i, row in enumerate(hourly):
-        if row.get("from") == day_start:
-            start = i
+def fit_hour(points, log_p1):
+    """Local fit for one hour; returns (log median, sigma).
+
+    points is a list of (log hour-1 viewers, log hour-h viewers) from the
+    comparables that have both hours.  The kernel is centred on the
+    target's log hour-1 print and widens until the effective sample is
+    big enough to trust, so a target far outside the comparables' range
+    still gets a stable, near-global fit instead of a noisy local one.
+    """
+    if len(points) < MIN_POINTS:
+        return log_p1, FALLBACK_SIGMA
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    bandwidth = BANDWIDTH
+    while True:
+        weights = [math.exp(-0.5 * ((x - log_p1) / bandwidth) ** 2)
+                   for x in xs]
+        total_w = sum(weights)
+        sum_w2 = sum(w * w for w in weights)
+        effective_n = (total_w * total_w / sum_w2) if sum_w2 > 0 else 0.0
+        if effective_n >= MIN_EFFECTIVE_N or bandwidth > 6.0:
             break
-    if start is None:
-        return None
-    rows = hourly[start:start + 24]
-    if len(rows) < 24:
-        return None
-    viewers = []
-    for row in rows:
-        try:
-            viewers.append(float(row["viewers"]))
-        except (KeyError, TypeError, ValueError):
-            return None
-    if viewers[0] <= 0 or any(v < 0 for v in viewers):
-        return None
-    return viewers
+        bandwidth *= 1.5
+    intercept, slope, sd = weighted_ols(xs, ys, weights)
+    sigma = min(max(sd, SIGMA_FLOOR), SIGMA_CAP)
+    return intercept + slope * log_p1, sigma
 
 
-def is_rolling(comp: dict) -> bool:
-    """True when the launch unlocked at midnight local time, rolling."""
-    unlock = str(comp.get("unlock", ""))
-    if _SIMULTANEOUS.search(unlock):
-        return False
-    lowered = unlock.lower()
-    return "midnight local" in lowered or "rolling" in lowered
+def hour_one_print(case):
+    """Hour 1's viewer print, from `known`, else the last hourly point."""
+    for row in case.get("known") or []:
+        if row.get("hour") == 1 and row.get("viewers"):
+            return max(1.0, float(row["viewers"]))
+    for row in reversed(case.get("history_hourly") or []):
+        if row.get("viewers"):
+            return max(1.0, float(row["viewers"]))
+    return 1.0
 
 
-def tier_of(comp: dict) -> str:
-    match = _TIER.search(json.dumps(comp))
-    return match.group(1) if match else ""
+def forecast_case(case, name):
+    """Forecast hours 2..24 of one case as five quantiles each."""
+    levels = case.get("levels") or LEVELS
+    z_scores = [Z_TABLE.get(level, 0.0) if level in Z_TABLE else 0.0
+                for level in levels]
+    if levels == LEVELS:
+        z_scores = list(Z)
 
-
-def collect_comparables(case: dict):
-    """Usable comparables, each as (viewers list, rolling?, tier)."""
-    out = []
-    for comp in case.get("comparables") or []:
-        viewers = release_day_viewers(comp)
-        if viewers is None:
-            continue
-        out.append((viewers, is_rolling(comp), tier_of(comp)))
-    return out
-
-
-def ols(xs, ys):
-    """Least squares y ~ a + b*x; returns (a, b)."""
-    n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx if sxx else 0.0
-    return my - b * mx, b
-
-
-def smooth(values):
-    """Light [0.25, 0.5, 0.25] smoothing across neighbouring hours."""
-    out = []
-    for i, v in enumerate(values):
-        if i == 0:
-            out.append(0.75 * values[0] + 0.25 * values[1])
-        elif i == len(values) - 1:
-            out.append(0.25 * values[-2] + 0.75 * values[-1])
-        else:
-            out.append(0.25 * values[i - 1] + 0.5 * v + 0.25 * values[i + 1])
-    return out
-
-
-def forecast_case(case: dict, name: str) -> dict:
-    if case.get("levels") != LEVELS:
-        raise ValueError(f"{name} asks for levels {case.get('levels')}, not {LEVELS}")
-    first = next((k for k in case.get("known", []) if k.get("hour") == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1.0, float(first["viewers"]))
+    p1 = hour_one_print(case)
     log_p1 = math.log(p1)
-    hours = [row["hour"] for row in case.get("forecast", [])]
 
-    comparables = collect_comparables(case)
-    shape = [v for v, rolling, tier in comparables
-             if rolling and tier == "comparable"]
-    if len(shape) < 4:
-        shape = [v for v, rolling, tier in comparables if tier == "comparable"]
-    if len(shape) < 4:
-        shape = [v for v, rolling, tier in comparables]
-    all_curves = [v for v, rolling, tier in comparables]
+    # One (log hour-1, {hour: log viewers}) pair per usable comparable.
+    comparables = []
+    for comp in case.get("comparables") or []:
+        hours = day_viewers(comp)
+        if 1 in hours:
+            comparables.append((math.log(hours[1]),
+                                {h: math.log(v) for h, v in hours.items()}))
 
-    rows = []
-    if not all_curves:
-        # No comparable at all: house baseline persistence.
-        for h in hours:
-            rows.append({
-                "hour": h,
-                "q": [round2(max(1.0, p1 * math.exp(z * BASELINE_SIGMA * math.sqrt(h - 1))))
-                      for z in Z],
-            })
-        return {"hours": rows}
-
-    # Median log-ratio curve and per-hour spread from the shape set.
-    medians = []
-    spreads = []
-    for h in range(1, 24):
-        ratios = sorted(math.log(v[h] / v[0]) for v in shape)
-        medians.append(statistics.median(ratios))
-        spreads.append(statistics.pstdev(ratios) if len(ratios) > 1 else 0.30)
-    medians = smooth(medians)
-
-    # Per-hour level regression over all usable comparables.
-    regressions = []
-    for h in range(1, 24):
-        xs = [math.log(v[0]) for v in all_curves]
-        ys = [math.log(max(1.0, v[h])) for v in all_curves]
-        regressions.append(ols(xs, ys) if len(xs) > 1 else (ys[0], 0.0))
-
-    for h in hours:
-        k = h - 2  # medians/regressions index 0 is hour 2
-        ratio_pred = log_p1 + medians[k]
-        a, b = regressions[k]
-        reg_pred = a + b * log_p1
-        pred = (1.0 - BLEND) * ratio_pred + BLEND * reg_pred
-        sd = min(SD_CAP, max(SD_FLOOR, spreads[k]))
+    rows = case.get("forecast") or [{"hour": h} for h in range(2, 25)]
+    hours_out = []
+    for row in sorted(rows, key=lambda r: r["hour"]):
+        hour = row["hour"]
+        if hour < 2 or hour > 24:
+            continue
+        points = [(log_first, by_hour[hour]) for log_first, by_hour
+                  in comparables if hour in by_hour]
+        log_median, sigma = fit_hour(points, log_p1)
         quantiles = []
-        prev = 0.0
-        for z in Z:
-            q = math.exp(pred + z * sd)
-            q = min(1_000_000_000.0, max(1.0, q))
-            q = max(q, prev)  # keep the row non-decreasing
-            quantiles.append(round2(q))
-            prev = quantiles[-1]
-        rows.append({"hour": h, "q": quantiles})
-    return {"hours": rows}
+        previous = 0.0
+        for z in z_scores:
+            value = math.exp(log_median + z * sigma)
+            value = min(max(value, 1.0), 1e9)
+            value = round2(value)
+            # Rounding must never break the non-decreasing order.
+            if value < previous:
+                value = previous
+            previous = value
+            quantiles.append(value)
+        hours_out.append({"hour": hour, "q": quantiles})
+    return {"hours": hours_out}
 
 
-def main() -> None:
+def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
-        )
+            json.dumps(forecast, separators=(",", ":")) + "\n",
+            encoding="utf-8")
 
 
 if __name__ == "__main__":
